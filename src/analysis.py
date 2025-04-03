@@ -19,6 +19,13 @@ NUM_CORES = max(1, multiprocessing.cpu_count() - 1)
 print(f"Using {NUM_CORES} CPU cores")
 print(f"Operating System: {platform.system()}")
 
+# Configure TensorFlow to use multiple threads
+tf.config.threading.set_inter_op_parallelism_threads(NUM_CORES)
+tf.config.threading.set_intra_op_parallelism_threads(NUM_CORES)
+
+# Enable XLA optimization for faster computations
+tf.config.optimizer.set_jit(True)
+
 # Custom metrics for model evaluation
 def recall_m(y_true, y_pred):
     true_positives = K.sum(K.round(K.clip(y_true * y_pred, 0, 1)))
@@ -215,81 +222,60 @@ def main():
     print(f"Batch size: {batch_size}")
     print(f"Steps per epoch: {steps_per_epoch}")
 
-    # Create data generators for training and validation
-    train_generator = datagen.flow(
-        x_train, 
-        y_train,
-        batch_size=batch_size,
-        shuffle=True,
-        seed=42
-    )
+    # Create TensorFlow Dataset for better parallelism
+    def augment_data(image, label):
+        # This function applies augmentation to individual samples
+        # It's more efficient and works with Windows multiprocessing
+        image = tf.image.random_flip_left_right(image, seed=42)
+        image = tf.image.random_brightness(image, 0.1, seed=42)
+        image = tf.image.random_contrast(image, 0.8, 1.2, seed=42)
+        return image, label
+    
+    # Create datasets for training and validation
+    train_dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    train_dataset = train_dataset.shuffle(buffer_size=len(x_train), seed=42)
+    train_dataset = train_dataset.map(augment_data, num_parallel_calls=tf.data.AUTOTUNE)
+    train_dataset = train_dataset.batch(batch_size)
+    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+    
+    val_dataset = tf.data.Dataset.from_tensor_slices((x_val, y_val)).batch(batch_size)
+    test_dataset = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(batch_size)
 
-    # Train the model
+    # Train the model using tf.data.Dataset
     print("\nStarting training...")
-    if platform.system() == 'Windows':
-        # On Windows, use single process mode to avoid pickling issues
-        print("Windows detected - using single process mode")
+    try:
+        history = model.fit(
+            train_dataset,
+            epochs=20,
+            validation_data=val_dataset,
+            callbacks=callbacks
+        )
+    except Exception as e:
+        print(f"Error during training: {e}")
+        print("Falling back to generator-based training...")
+        # Create traditional generator as fallback
+        train_generator = datagen.flow(
+            x_train, 
+            y_train,
+            batch_size=batch_size,
+            shuffle=True,
+            seed=42
+        )
         history = model.fit(
             train_generator,
             steps_per_epoch=steps_per_epoch,
             epochs=20,
-            validation_data=(x_test, y_test),
+            validation_data=(x_val, y_val),
             callbacks=callbacks,
             shuffle=True
         )
-    else:
-        # On other systems, try multiprocessing
-        try:
-            history = model.fit(
-                train_generator,
-                steps_per_epoch=steps_per_epoch,
-                epochs=20,
-                validation_data=(x_test, y_test),
-                callbacks=callbacks,
-                workers=NUM_CORES,
-                use_multiprocessing=True,
-                max_queue_size=10,
-                shuffle=True
-            )
-        except Exception as e:
-            print(f"Error during training with multiprocessing: {e}")
-            print("Falling back to single process training...")
-            history = model.fit(
-                train_generator,
-                steps_per_epoch=steps_per_epoch,
-                epochs=20,
-                validation_data=(x_test, y_test),
-                callbacks=callbacks,
-                shuffle=True
-            )
 
     # Plot training history
     plot_training_history(history)
 
     # Evaluate the model
     print("\nEvaluating model on test set...")
-    if platform.system() == 'Windows':
-        # On Windows, use single process mode
-        test_loss, test_acc, test_f1, test_precision, test_recall = model.evaluate(
-            x_test, y_test,
-            batch_size=batch_size
-        )
-    else:
-        # On other systems, try multiprocessing
-        try:
-            test_loss, test_acc, test_f1, test_precision, test_recall = model.evaluate(
-                x_test, y_test,
-                batch_size=batch_size,
-                workers=NUM_CORES,
-                use_multiprocessing=True
-            )
-        except Exception as e:
-            print(f"Error during test evaluation with multiprocessing: {e}")
-            print("Falling back to single process evaluation...")
-            test_loss, test_acc, test_f1, test_precision, test_recall = model.evaluate(
-                x_test, y_test,
-                batch_size=batch_size
-            )
+    test_loss, test_acc, test_f1, test_precision, test_recall = model.evaluate(test_dataset)
     
     print(f'Test Loss: {test_loss:.4f}')
     print(f'Test Accuracy: {test_acc:.4f}')
@@ -298,28 +284,7 @@ def main():
     print(f'Test Recall: {test_recall:.4f}')
 
     print("\nEvaluating model on validation set...")
-    if platform.system() == 'Windows':
-        # On Windows, use single process mode
-        val_loss, val_acc, val_f1, val_precision, val_recall = model.evaluate(
-            x_val, y_val,
-            batch_size=batch_size
-        )
-    else:
-        # On other systems, try multiprocessing
-        try:
-            val_loss, val_acc, val_f1, val_precision, val_recall = model.evaluate(
-                x_val, y_val,
-                batch_size=batch_size,
-                workers=NUM_CORES,
-                use_multiprocessing=True
-            )
-        except Exception as e:
-            print(f"Error during validation evaluation with multiprocessing: {e}")
-            print("Falling back to single process evaluation...")
-            val_loss, val_acc, val_f1, val_precision, val_recall = model.evaluate(
-                x_val, y_val,
-                batch_size=batch_size
-            )
+    val_loss, val_acc, val_f1, val_precision, val_recall = model.evaluate(val_dataset)
     
     print(f'Validation Loss: {val_loss:.4f}')
     print(f'Validation Accuracy: {val_acc:.4f}')
@@ -328,8 +293,4 @@ def main():
     print(f'Validation Recall: {val_recall:.4f}')
 
 if __name__ == "__main__":
-    # Set TensorFlow to use all available CPU cores
-    tf.config.threading.set_inter_op_parallelism_threads(NUM_CORES)
-    tf.config.threading.set_intra_op_parallelism_threads(NUM_CORES)
-    
     main()
